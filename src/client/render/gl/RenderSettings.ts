@@ -1,5 +1,6 @@
 import colorblindTheme from "./colorblind-theme.json";
 import defaultTheme from "./default-theme.json";
+import { PALETTE_NAMES } from "./GraphicsOverrides";
 import defaults from "./render-settings.json";
 
 /**
@@ -60,6 +61,12 @@ export interface RenderSettings {
   };
   terrain: {
     /**
+     * Map background color as a "#rrggbb" hex string — the clear color drawn
+     * outside the map quad. Impassable terrain is baked to the same color so
+     * the map keeps its non-rectangular silhouette.
+     */
+    backgroundColor: string;
+    /**
      * Base (shallowest) color of deep water as a "#rrggbb" hex string. The
      * per-depth brightness gradient is preserved relative to this color.
      */
@@ -119,6 +126,11 @@ export interface RenderSettings {
   };
   mapOverlay: {
     trailAlpha: number;
+    /**
+     * Resolution of the offscreen spiral-trail buffer relative to the canvas
+     * (0..1). Lower = cheaper + softer/glowier (bilinear upsample).
+     */
+    spiralResolutionScale: number;
     defenseCheckerDarken: number;
     territoryDefenseDarken: number;
     /** Saturation of the territory fill. 1 = full color, 0 = grayscale. */
@@ -132,6 +144,7 @@ export interface RenderSettings {
     staleNukeR: number;
     staleNukeG: number;
     staleNukeB: number;
+    navalHighlight: boolean;
     highlightBrighten: number;
     highlightFillBrighten: number;
     highlightThicken: number;
@@ -384,6 +397,7 @@ export interface RenderSettings {
     color: number[]; // RGB, each 0–1
     alpha: number; // peak opacity (0–1)
     pulseSpeed: number; // breath animation speed
+    strength: number; // opacity fade: 0 = off, 1 = full brightness (default 0.35)
   };
   altView: {
     gridFontSize: number;
@@ -401,7 +415,7 @@ export interface RenderSettings {
   lightConfigs: Record<string, { radius: number; intensity: number }>;
 }
 
-export type ThemeName = "default" | "colorblind";
+export type ThemeName = (typeof PALETTE_NAMES)[number];
 
 // Typed so tsc validates each theme JSON against the ThemeSettings shape.
 const THEMES: Record<ThemeName, ThemeSettings> = {

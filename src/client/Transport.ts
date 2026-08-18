@@ -57,6 +57,7 @@ export class SendUpgradeStructureIntentEvent implements GameEvent {
   constructor(
     public readonly unitId: number,
     public readonly unitType: UnitType,
+    public readonly amount: number = 1,
   ) {}
 }
 
@@ -91,6 +92,7 @@ export class BuildUnitIntentEvent implements GameEvent {
     public readonly unit: UnitType,
     public readonly tile: TileRef,
     public readonly rocketDirectionUp?: boolean,
+    public readonly amount?: number,
   ) {}
 }
 
@@ -347,10 +349,10 @@ export class Transport {
   ) {
     this.startPing();
     this.killExistingSocket();
-    const wsHost = window.location.host;
-    const wsProtocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+    // WS origin comes from ClientEnv (same-origin on web, audience-derived on
+    // the desktop app://openfront origin), not window.location.host.
     const workerPath = ClientEnv.workerPath(this.lobbyConfig.gameID);
-    this.socket = new WebSocket(`${wsProtocol}//${wsHost}/${workerPath}`);
+    this.socket = new WebSocket(`${ClientEnv.serverWsBase()}/${workerPath}`);
     this.onconnect = onconnect;
     this.onmessage = onmessage;
     this.socket.onopen = () => {
@@ -518,6 +520,7 @@ export class Transport {
       type: "upgrade_structure",
       unit: event.unitType,
       unitId: event.unitId,
+      amount: event.amount,
     });
   }
 
@@ -583,6 +586,7 @@ export class Transport {
       unit: event.unit,
       tile: event.tile,
       rocketDirectionUp: event.rocketDirectionUp,
+      amount: event.amount,
     });
   }
 

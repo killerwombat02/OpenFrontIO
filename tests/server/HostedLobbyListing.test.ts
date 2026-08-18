@@ -9,9 +9,12 @@ import {
   GameType,
 } from "../../src/core/game/Game";
 import {
+  FEATURED_LOBBY_AUTO_START_MS,
   HOSTED_LOBBY_AUTO_START_MS,
+  LobbyLabelSchema,
   MAX_HOSTED_LOBBIES,
 } from "../../src/core/Schemas";
+import { LOBBY_LABEL_MAX, sanitizeLobbyLabel } from "../../src/core/Util";
 import { Client } from "../../src/server/Client";
 import { GameManager } from "../../src/server/GameManager";
 import {
@@ -404,6 +407,24 @@ describe("listed lobby host powers", () => {
     expect(game.handleIntent(kick, asHost).status).toBe(200);
   });
 
+  it("blocks host pause controls while listed", () => {
+    const game = makeGame("g-pause");
+    (game as any)._hasStarted = true;
+    game.setListed(true);
+
+    const pause = { type: "toggle_pause", paused: true } as any;
+    expect(game.handleIntent(pause, asHost)).toEqual({
+      status: 403,
+      error: "the host cannot pause a publicly listed game",
+    });
+    expect((game as any).isPaused).toBe(false);
+
+    // Unlisting restores the host's pause control.
+    game.setListed(false);
+    expect(game.handleIntent(pause, asHost).status).toBe(200);
+    expect((game as any).isPaused).toBe(true);
+  });
+
   it("lets admins kick in a listed lobby", () => {
     const game = makeGame("g-admin-kick");
     game.joinClient(makeClient("host", CREATOR, fakeWs()));
@@ -522,6 +543,27 @@ describe("MasterLobbyService hosted lobbies", () => {
     ]);
   });
 
+  it("keeps the valid lobbies when a report contains a malformed entry", () => {
+    const { service, workers } = createService();
+    workers[0].emit("message", {
+      type: "lobbyList",
+      lobbies: [
+        // Missing publicGameType, like a matchmaking game reported by
+        // mistake. It must be dropped without discarding the whole report.
+        { gameID: "bad", numClients: 0 },
+        hostedLobby("ok", "creator-a"),
+      ],
+    });
+
+    (service as any).broadcastLobbies();
+
+    const broadcast = sentMessages(workers[0]).find(
+      (m) => m.type === "lobbiesBroadcast",
+    );
+    const hosted = broadcast.publicGames.games.hosted;
+    expect(hosted.map((l: InternalGameInfo) => l.gameID)).toEqual(["ok"]);
+  });
+
   it("delists a dedup loser only after two consecutive losing broadcasts", () => {
     const { service, workers } = createService();
     workers[0].emit("message", {
@@ -565,6 +607,39 @@ describe("MasterLobbyService hosted lobbies", () => {
     // after two consecutive losing cycles, delisted.
     expect(broadcasts[0].delistGameIDs).toBeUndefined();
     expect(broadcasts[1].delistGameIDs).toEqual([`g${MAX_HOSTED_LOBBIES}`]);
+  });
+
+  it("keeps a featured lobby listed when the cap overflows", () => {
+    // Delisting is permanent — the worker clears listedAt — so an announced
+    // event that loses the cap never comes back and its audience arrives to
+    // nothing. The featured lobby here sorts LAST by gameID, so without
+    // priority it is exactly the one the overflow would drop.
+    const { service, workers } = createService();
+    const ordinary = Array.from({ length: MAX_HOSTED_LOBBIES }, (_, i) =>
+      hostedLobby(`g${String(i).padStart(2, "0")}`, `creator-${i}`),
+    );
+    const featured = hostedLobby("zzz", "creator-adminbot", {
+      featured: true,
+      label: "Europe — OFM Scrims",
+    });
+    workers[0].emit("message", {
+      type: "lobbyList",
+      lobbies: [...ordinary, featured],
+    });
+
+    (service as any).broadcastLobbies();
+    (service as any).broadcastLobbies();
+
+    const broadcasts = sentMessages(workers[0]).filter(
+      (m) => m.type === "lobbiesBroadcast",
+    );
+    const hosted = broadcasts[0].publicGames.games.hosted;
+    expect(hosted).toHaveLength(MAX_HOSTED_LOBBIES);
+    expect(hosted[0].gameID).toBe("zzz");
+    // An ordinary lobby takes the overflow instead.
+    expect(broadcasts[1].delistGameIDs).toEqual([
+      `g${String(MAX_HOSTED_LOBBIES - 1).padStart(2, "0")}`,
+    ]);
   });
 
   it("does not delist when the duplicate disappears after one broadcast", () => {
@@ -693,6 +768,35 @@ describe("WorkerLobbyService hosted lobbies", () => {
     expect(reported.gameConfig.nameReveals).toBeUndefined();
     expect(reported.gameConfig.nameRevealPublicIds).toBeUndefined();
     expect(reported.gameConfig.hostCheats).toBeUndefined();
+  });
+
+  it("excludes matchmaking games (Public but no publicGameType) from the report", () => {
+    const ranked = new GameServer(
+      "ranked-g1",
+      mockLogger,
+      Date.now(),
+      { gameType: GameType.Public, allowedPublicIds: ["p1", "p2"] } as any,
+      undefined,
+      Date.now() + 7000,
+      undefined, // matchmaking games are created without a publicGameType
+    );
+    const ffa = new GameServer(
+      "ffa-g1",
+      mockLogger,
+      Date.now(),
+      { gameType: GameType.Public } as any,
+      undefined,
+      undefined,
+      "ffa",
+    );
+    gm.publicLobbies.mockReturnValue([ranked, ffa]);
+
+    emitBroadcast({ ffa: [], team: [], special: [], hosted: [] });
+
+    const lobbyList = sendToMaster.mock.calls
+      .map((c: any[]) => c[0])
+      .find((m: any) => m.type === "lobbyList");
+    expect(lobbyList.lobbies.map((l: any) => l.gameID)).toEqual(["ffa-g1"]);
   });
 
   it("strips creatorID from broadcasts and primed snapshots sent to clients", () => {
@@ -836,5 +940,112 @@ describe("WorkerLobbyService hosted lobbies", () => {
     ]);
 
     expect(game.isListed()).toBe(false);
+  });
+});
+
+describe("featured lobbies", () => {
+  beforeEach(() => {
+    // The deadline assertions compare absolute timestamps, so time must not
+    // advance mid-test (the same reason the listing suite fakes timers).
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.clearAllTimers();
+    vi.useRealTimers();
+  });
+
+  it("is not featured by default and carries no label", () => {
+    const game = makeGame();
+    expect(game.isFeatured()).toBe(false);
+    expect(game.lobbyLabel()).toBeUndefined();
+  });
+
+  it("extends the auto-start deadline to the featured window", () => {
+    const game = makeGame();
+    game.setListed(true);
+    expect(game.autoStartAt()).toBe(Date.now() + HOSTED_LOBBY_AUTO_START_MS);
+    game.setFeatured({ label: "Europe — OFM Scrims" });
+    expect(game.autoStartAt()).toBe(Date.now() + FEATURED_LOBBY_AUTO_START_MS);
+  });
+
+  it("has no deadline at all while unlisted", () => {
+    const game = makeGame();
+    game.setFeatured({ label: "Europe — OFM Scrims" });
+    expect(game.autoStartAt()).toBeUndefined();
+  });
+
+  it("keeps emoji but strips control characters and bidi overrides", () => {
+    // A bidi override renders following text right-to-left, which is how a
+    // label gets to claim it is something it is not.
+    expect(sanitizeLobbyLabel("🏆 OFM\u202E evil\u0000")).toBe("🏆 OFM evil");
+  });
+
+  it("strips U+061C but keeps the ZWJ that emoji sequences need", () => {
+    // ARABIC LETTER MARK is zero-width and bidi-active, so it goes. U+200D is
+    // what joins 👨‍👩‍👧 into one glyph, so it must stay.
+    expect(sanitizeLobbyLabel("OFM\u061C Scrims")).toBe("OFM Scrims");
+    expect(sanitizeLobbyLabel("\u{1F468}\u200D\u{1F469}\u200D\u{1F467}")).toBe(
+      "\u{1F468}\u200D\u{1F469}\u200D\u{1F467}",
+    );
+  });
+
+  it("accepts a label of exactly LOBBY_LABEL_MAX emoji", () => {
+    // 48 emoji is 96 UTF-16 code units: a z.string().max() cap would reject a
+    // label the sanitiser considers perfectly legal.
+    const label = "\u{1F3C6}".repeat(LOBBY_LABEL_MAX);
+    expect(LobbyLabelSchema.safeParse(label).success).toBe(true);
+    expect(Array.from(sanitizeLobbyLabel(label))).toHaveLength(LOBBY_LABEL_MAX);
+    expect(
+      LobbyLabelSchema.safeParse("\u{1F3C6}".repeat(LOBBY_LABEL_MAX + 1))
+        .success,
+    ).toBe(false);
+  });
+
+  it("collapses whitespace and caps length", () => {
+    expect(sanitizeLobbyLabel("  a\n\n  b  ")).toBe("a b");
+    expect(sanitizeLobbyLabel("x".repeat(200))).toHaveLength(LOBBY_LABEL_MAX);
+  });
+
+  it("turns a line break into a space instead of eating it", () => {
+    // Newline and tab are C0 controls, but they are also word separators:
+    // dropping them the way the other controls are dropped welds the words
+    // together. Note the words here are NOT flanked by spaces — a stray space
+    // either side would hide the bug behind the collapse step.
+    expect(sanitizeLobbyLabel("Europe\nOFM Scrims")).toBe("Europe OFM Scrims");
+    expect(sanitizeLobbyLabel("Europe\tOFM")).toBe("Europe OFM");
+    expect(sanitizeLobbyLabel("Europe\r\n\r\nOFM")).toBe("Europe OFM");
+  });
+
+  it("stores a sanitised label, never the raw one", () => {
+    const game = makeGame();
+    game.setFeatured({ label: "  OFM\u0007  Scrims  ", accent: "gold" });
+    expect(game.lobbyLabel()).toBe("OFM Scrims");
+    expect(game.lobbyAccent()).toBe("gold");
+  });
+
+  it("drops a label that sanitises away to nothing", () => {
+    const game = makeGame();
+    game.setFeatured({ label: "\u0000\u202E   " });
+    expect(game.lobbyLabel()).toBeUndefined();
+    expect(game.isFeatured()).toBe(true);
+  });
+
+  it("cannot be featured through update_game_config", () => {
+    const game = makeGame();
+    const result = game.handleIntent(
+      {
+        type: "update_game_config",
+        config: { featured: true, label: "Official Event" },
+      } as any,
+      {
+        clientID: "c1",
+        isLobbyCreator: true,
+        isAdmin: false,
+        isAdminBot: false,
+      },
+    );
+    expect(result.status).toBe(200);
+    expect(game.isFeatured()).toBe(false);
+    expect(game.lobbyLabel()).toBeUndefined();
   });
 });

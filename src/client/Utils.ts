@@ -15,10 +15,14 @@ import { GameConfig } from "../core/Schemas";
 import type { LangSelector } from "./LangSelector";
 import { Platform } from "./Platform";
 
-export const TUTORIAL_VIDEO_URL = "https://www.youtube.com/embed/EN2oOog3pSs";
+export const TUTORIAL_VIDEO_URL = "https://www.youtube.com/embed/7J5zwb_s_Cg";
 
 export function normaliseMapKey(mapName: string): string {
-  return mapName.toLowerCase().replace(/[\s.]+/g, "");
+  // Asset dirs / translation keys are the map id lowercased. For most maps
+  // stripping spaces from the display name gives the same string, but not for
+  // the tourney maps (e.g. "Tourney 2 Teams" lives in maps/tourney1/).
+  const id = maps.find((m) => m.type === mapName)?.id;
+  return (id ?? mapName).toLowerCase().replace(/[\s.]+/g, "");
 }
 
 export function getMapName(mapName: string | undefined): string | null {
@@ -115,7 +119,7 @@ function getTeamSize(
 }
 
 export interface ModifierInfo {
-  /** Translation key for detailed label (e.g. "host_modal.random_spawn") */
+  /** Translation key for detailed label (e.g. "game_settings.random_spawn") */
   labelKey: string;
   /** Translation key for badge/short label (e.g. "public_game_modifier.random_spawn") */
   badgeKey: string;
@@ -138,13 +142,13 @@ export function getActiveModifiers(
   const result: ModifierInfo[] = [];
   if (modifiers.isRandomSpawn) {
     result.push({
-      labelKey: "host_modal.random_spawn",
+      labelKey: "game_settings.random_spawn",
       badgeKey: "public_game_modifier.random_spawn",
     });
   }
   if (modifiers.isCompact) {
     result.push({
-      labelKey: "host_modal.compact_map",
+      labelKey: "game_settings.compact_map",
       badgeKey: "public_game_modifier.compact_map",
     });
   }
@@ -176,7 +180,7 @@ export function getActiveModifiers(
   }
   if (modifiers.goldMultiplier) {
     result.push({
-      labelKey: "host_modal.gold_multiplier",
+      labelKey: "game_settings.gold_multiplier",
       badgeKey: "public_game_modifier.gold_multiplier",
       badgeParams: {
         amount: modifiers.goldMultiplier,
@@ -293,6 +297,7 @@ export async function copyToClipboard(
     }
   } catch (err) {
     console.warn("Failed to copy to clipboard", err);
+    throw err;
   }
 }
 

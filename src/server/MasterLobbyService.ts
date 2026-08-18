@@ -8,6 +8,7 @@ import {
 import { generateID } from "../core/Util";
 import {
   InternalGameInfo,
+  InternalGameInfoSchema,
   MasterCreateGame,
   MasterLobbiesBroadcast,
   MasterUpdateGame,
@@ -57,10 +58,28 @@ export class MasterLobbyService {
           this.handleWorkerReady(msg.workerId);
           break;
         case "lobbyList":
-          this.workerLobbies.set(workerId, msg.lobbies);
+          this.workerLobbies.set(workerId, this.validLobbies(msg.lobbies));
           break;
       }
     });
+  }
+
+  // Lobby entries are validated individually so one malformed entry only
+  // drops itself. Rejecting the whole report would freeze this worker's
+  // lobbies in the master's view for as long as the bad entry exists —
+  // stale broadcasts to every client, countdown resets, and duplicate
+  // scheduling.
+  private validLobbies(lobbies: unknown[]): InternalGameInfo[] {
+    const valid: InternalGameInfo[] = [];
+    for (const lobby of lobbies) {
+      const result = InternalGameInfoSchema.safeParse(lobby);
+      if (result.success) {
+        valid.push(result.data);
+      } else {
+        this.log.error("Dropping invalid lobby in worker report:", lobby);
+      }
+    }
+    return valid;
   }
 
   removeWorker(workerId: number) {
@@ -137,6 +156,19 @@ export class MasterLobbyService {
       seenCreators.add(lobby.creatorID);
       return true;
     });
+
+    // Featured lobbies keep their place when the list overflows. They are
+    // announced events with a published start time, and delisting is permanent
+    // — the worker clears listedAt, so an event lobby that loses the cap never
+    // comes back and its audience arrives to nothing. Only an admin bot can set
+    // featured, and the per-creator dedup above already caps each host at one
+    // listing, so this cannot be used to crowd the list. Stable within each
+    // group: the sort above still decides order among featured and among the
+    // rest.
+    result.hosted = [
+      ...result.hosted.filter((l) => l.featured),
+      ...result.hosted.filter((l) => !l.featured),
+    ];
 
     // Cluster-wide cap to prevent listing spam. Workers reject listings past
     // the cap too, but their view lags by a broadcast round-trip; overflow

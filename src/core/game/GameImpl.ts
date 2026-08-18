@@ -116,6 +116,8 @@ export class GameImpl implements Game {
   private _waterManager: WaterManager;
   private _sharedWaterCache: SharedWaterCache;
   private _teamGameSpawnAreas: TeamGameSpawnAreas | undefined;
+  /** Tiles from nuke blast radii this tick, drained by the renderer. */
+  private _nukeImpactQueue: TileRef[] = [];
 
   constructor(
     private _humans: PlayerInfo[],
@@ -212,7 +214,13 @@ export class GameImpl implements Game {
       ...this._humans,
       ...this._nations.map((n) => n.playerInfo),
     ];
-    const playerToTeam = assignTeams(allPlayers, this.playerTeams);
+    const pt = this._config.playerTeams();
+    const isDuosTriosQuads = pt === Duos || pt === Trios || pt === Quads;
+    const playerToTeam = assignTeams(
+      allPlayers,
+      this.playerTeams,
+      isDuosTriosQuads,
+    );
     for (const [playerInfo, team] of playerToTeam.entries()) {
       if (team === "kicked") {
         console.warn(`Player ${playerInfo.name} was kicked from team`);
@@ -287,6 +295,16 @@ export class GameImpl implements Game {
       return;
     }
     this._waterManager.queueTile(tile);
+  }
+
+  queueNukeImpact(tile: TileRef): void {
+    this._nukeImpactQueue.push(tile);
+  }
+
+  drainNukeImpacts(): TileRef[] {
+    const tiles = this._nukeImpactQueue;
+    this._nukeImpactQueue = [];
+    return tiles;
   }
 
   unit(id: number): Unit | undefined {
@@ -890,7 +908,10 @@ export class GameImpl implements Game {
     });
   }
 
-  setWinner(winner: Player | Team, allPlayersStats: AllPlayersStats): void {
+  setWinner(
+    winner: Player | Team | null,
+    allPlayersStats: AllPlayersStats,
+  ): void {
     this._winner = winner;
     // OFM: snapshot final tiles for standings (bots skipped in recordFinalTiles).
     for (const player of this.players()) {
@@ -898,7 +919,7 @@ export class GameImpl implements Game {
     }
     this.addUpdate({
       type: GameUpdateType.Win,
-      winner: this.makeWinner(winner),
+      winner: winner === null ? undefined : this.makeWinner(winner),
       allPlayersStats,
     });
   }

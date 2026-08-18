@@ -39,6 +39,7 @@ export function diffPlayerUpdate(
     prev.clientID === next.clientID &&
     prev.name === next.name &&
     prev.displayName === next.displayName &&
+    prev.clanTag === next.clanTag &&
     prev.team === next.team &&
     prev.smallID === next.smallID &&
     prev.playerType === next.playerType &&
@@ -50,6 +51,7 @@ export function diffPlayerUpdate(
     prev.traitorRemainingTicks === next.traitorRemainingTicks &&
     prev.inDoomsdayClock === next.inDoomsdayClock &&
     prev.markedDoomsdayClockTick === next.markedDoomsdayClockTick &&
+    prev.isDecaying === next.isDecaying &&
     prev.hasSpawned === next.hasSpawned &&
     prev.spawnTile === next.spawnTile &&
     prev.betrayals === next.betrayals &&
@@ -86,6 +88,7 @@ export function diffPlayerUpdate(
   setIfDifferent("clientID", prev.clientID === next.clientID);
   setIfDifferent("name", prev.name === next.name);
   setIfDifferent("displayName", prev.displayName === next.displayName);
+  setIfDifferent("clanTag", prev.clanTag === next.clanTag);
   setIfDifferent("team", prev.team === next.team);
   setIfDifferent("smallID", prev.smallID === next.smallID);
   setIfDifferent("playerType", prev.playerType === next.playerType);
@@ -107,6 +110,7 @@ export function diffPlayerUpdate(
     "markedDoomsdayClockTick",
     prev.markedDoomsdayClockTick === next.markedDoomsdayClockTick,
   );
+  setIfDifferent("isDecaying", prev.isDecaying === next.isDecaying);
   setIfDifferent("hasSpawned", prev.hasSpawned === next.hasSpawned);
   setIfDifferent("spawnTile", prev.spawnTile === next.spawnTile);
   setIfDifferent("betrayals", prev.betrayals === next.betrayals);
@@ -175,6 +179,7 @@ export function applyStateUpdate(target: PlayerState, pu: PlayerUpdate): void {
   if (pu.markedDoomsdayClockTick !== undefined) {
     target.markedDoomsdayClockTick = pu.markedDoomsdayClockTick;
   }
+  if (pu.isDecaying !== undefined) target.isDecaying = pu.isDecaying;
   if (pu.betrayals !== undefined) target.betrayals = pu.betrayals;
   if (pu.hasSpawned !== undefined) target.hasSpawned = pu.hasSpawned;
   if (pu.spawnTile !== undefined) target.spawnTile = pu.spawnTile;

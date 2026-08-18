@@ -61,6 +61,9 @@ export class ContextMenuEvent implements GameEvent {
   ) {}
 }
 
+/** Zoom sensitivity: scale is divided by `1 + delta / ZOOM_DELTA_DIVISOR`. */
+export const ZOOM_DELTA_DIVISOR = 600;
+
 export class ZoomEvent implements GameEvent {
   constructor(
     public readonly x: number,
@@ -198,6 +201,20 @@ interface KeybindEntry {
   conditions: Array<(e: KeyboardEvent) => boolean>;
 }
 
+/**
+ * WebKit's non-standard `GestureEvent`, fired for trackpad pinch in Safari.
+ * Other browsers synthesize a ctrl+wheel event instead, handled in onScroll.
+ * Not in `lib.dom.d.ts`, so declared here.
+ *
+ * @see https://developer.apple.com/library/archive/documentation/AppleApplications/Reference/SafariWebContent/HandlingEvents/HandlingEvents.html
+ */
+interface WebKitGestureEvent extends Event {
+  /** Cumulative pinch scale since `gesturestart`, which reports 1.0. */
+  readonly scale: number;
+  readonly clientX: number;
+  readonly clientY: number;
+}
+
 export class InputHandler {
   private lastPointerX: number = 0;
   private lastPointerY: number = 0;
@@ -209,6 +226,9 @@ export class InputHandler {
 
   private lastPinchDistance: number = 0;
 
+  // Scale of the in-progress Safari pinch, or null when no gesture is active.
+  private lastGestureScale: number | null = null;
+
   private pointerDown: boolean = false;
 
   private alternateView = false;
@@ -217,6 +237,9 @@ export class InputHandler {
   private selectionBoxActive: boolean = false;
   // True while warships are selected via box (waiting for move target click)
   private multiSelectionActive: boolean = false;
+  // True while any warship/boat is selected (single or multi) — right-click
+  // cancels the selection instead of opening the context menu (#4692).
+  private unitSelectionActive: boolean = false;
 
   // Touch long-press state
   private longPressTimer: ReturnType<typeof setTimeout> | null = null;
@@ -406,6 +429,8 @@ export class InputHandler {
     }
     // Listen for warship selection to change cursor
     this.eventBus.on(UnitSelectionEvent, (e) => {
+      this.unitSelectionActive =
+        e.isSelected && (e.unit !== null || (e.units ?? []).length > 0);
       if (e.isSelected && (e.units ?? []).length > 0) {
         // Multi-selection active
         this.multiSelectionActive = true;
@@ -435,6 +460,31 @@ export class InputHandler {
       },
       { passive: false },
     );
+    // Safari trackpad pinch, which fires no ctrl+wheel event.
+    this.canvas.addEventListener(
+      "gesturestart",
+      (e) => {
+        e.preventDefault();
+        this.lastGestureScale = (e as WebKitGestureEvent).scale;
+      },
+      { passive: false },
+    );
+    this.canvas.addEventListener(
+      "gesturechange",
+      (e) => {
+        e.preventDefault();
+        this.onGestureChange(e as WebKitGestureEvent);
+      },
+      { passive: false },
+    );
+    this.canvas.addEventListener(
+      "gestureend",
+      (e) => {
+        e.preventDefault();
+        this.lastGestureScale = null;
+      },
+      { passive: false },
+    );
     window.addEventListener("pointermove", this.onPointerMove.bind(this));
     this.canvas.addEventListener("contextmenu", (e) => this.onContextMenu(e));
     window.addEventListener("mousemove", (e) => {
@@ -454,6 +504,7 @@ export class InputHandler {
       }
       this.pointerDown = false;
       this.pointers.clear();
+      this.lastGestureScale = null;
       if (this.longPressTimer !== null) {
         clearTimeout(this.longPressTimer);
         this.longPressTimer = null;
@@ -473,8 +524,8 @@ export class InputHandler {
       let deltaX = 0;
       let deltaY = 0;
 
-      // Skip if shift is held down
-      if (this.activeKeys.has(this.keybinds.shiftKey)) {
+      // Skip if select warship modifier is held down
+      if (this.activeKeys.has(this.keybinds.boxSelectWarships)) {
         return;
       }
 
@@ -549,12 +600,26 @@ export class InputHandler {
 
       if (e.code === "Escape") {
         e.preventDefault();
-        this.eventBus.emit(new CloseViewEvent());
-        this.setGhostStructure(null);
-        if (this.selectionBoxActive || this.multiSelectionActive) {
+        let closedUI = false;
+
+        if (this.uiState.ghostStructure !== null) {
+          this.setGhostStructure(null);
+          closedUI = true;
+        }
+
+        if (this.selectionBoxActive) {
           this.selectionBoxActive = false;
-          this.multiSelectionActive = false;
           this.eventBus.emit(new WarshipSelectionBoxCancelEvent());
+          closedUI = true;
+        }
+
+        this.eventBus.emit(new CloseViewEvent());
+
+        if (
+          !closedUI &&
+          (this.unitSelectionActive || this.multiSelectionActive)
+        ) {
+          this.eventBus.emit(new UnitSelectionEvent(null, false));
         }
       }
 
@@ -576,6 +641,14 @@ export class InputHandler {
           e.code === "Equal" ||
           e.code === "NumpadAdd" ||
           e.code === "NumpadSubtract");
+
+      const isConfiguredKeybind =
+        Object.values(this.keybinds).includes(e.code) ||
+        this.keybindAndEvent.some(([k]) => this.keybindMatchesEvent(e, k));
+
+      if (isConfiguredKeybind && !isBrowserZoomCombo) {
+        e.preventDefault();
+      }
 
       if (
         !isBrowserZoomCombo &&
@@ -599,7 +672,7 @@ export class InputHandler {
           this.keybinds.centerCamera,
           "ControlLeft",
           "ControlRight",
-          this.keybinds.shiftKey,
+          this.keybinds.boxSelectWarships,
           this.keybinds.emojiMenuModifier,
           this.keybinds.buildMenuModifier,
           this.keybinds.altKey,
@@ -608,9 +681,9 @@ export class InputHandler {
         this.activeKeys.add(e.code);
       }
 
-      // Shift = warship box selection mode.
+      // warship box selection mode.
       // If a ghost structure is active, discard it first.
-      if (e.code === this.keybinds.shiftKey) {
+      if (e.code === this.keybinds.boxSelectWarships) {
         if (this.uiState.ghostStructure !== null) {
           this.setGhostStructure(null);
         }
@@ -656,7 +729,7 @@ export class InputHandler {
 
       // Reset crosshair when Shift is released (unless selection box or multi-selection still active)
       if (
-        e.code === this.keybinds.shiftKey &&
+        e.code === this.keybinds.boxSelectWarships &&
         !this.selectionBoxActive &&
         !this.multiSelectionActive
       ) {
@@ -799,7 +872,8 @@ export class InputHandler {
       if (
         !this.userSettings.leftClickOpensMenu() ||
         event.shiftKey ||
-        this.gameView.inSpawnPhase() // No Radial Menu during spawn phase, only spawn point selection
+        this.gameView.inSpawnPhase() || // No Radial Menu during spawn phase, only spawn point selection
+        this.uiState.ghostStructure !== null // Block radial menu on left click if building
       ) {
         this.eventBus.emit(new MouseUpEvent(event.x, event.y));
       } else {
@@ -835,6 +909,29 @@ export class InputHandler {
       if (Math.abs(event.deltaY) < 2) return;
       this.eventBus.emit(new ZoomEvent(event.x, event.y, event.deltaY));
     }
+  }
+
+  /**
+   * `scale` is cumulative since gesturestart, so the per-event ratio is
+   * `scale / lastGestureScale`. onZoom divides by `1 + delta / DIVISOR`, so
+   * inverting that gives the delta reproducing the pinch ratio exactly.
+   */
+  private onGestureChange(event: WebKitGestureEvent) {
+    if (this.lastGestureScale === null) return;
+
+    const ratio = event.scale / this.lastGestureScale;
+    if (!Number.isFinite(ratio) || ratio <= 0) return;
+    // Advance the scale before the pointer guard: if a pointer lifts mid-gesture,
+    // the next event must measure from here, not re-apply zoom from gesturestart.
+    this.lastGestureScale = event.scale;
+
+    // iOS sends these alongside pointer events, which onPointerMove already
+    // zooms from. A trackpad pinch registers no pointers.
+    if (this.pointers.size >= 2) return;
+
+    const delta = ZOOM_DELTA_DIVISOR * (1 / ratio - 1);
+    if (delta === 0) return;
+    this.eventBus.emit(new ZoomEvent(event.clientX, event.clientY, delta));
   }
 
   private onShiftScroll(event: WheelEvent) {
@@ -882,7 +979,7 @@ export class InputHandler {
       // started, continue emitting selection box updates
       if (
         this.selectionBoxActive ||
-        this.activeKeys.has(this.keybinds.shiftKey) ||
+        this.activeKeys.has(this.keybinds.boxSelectWarships) ||
         this.longPressActive
       ) {
         this.selectionBoxActive = true;
@@ -923,11 +1020,26 @@ export class InputHandler {
       this.setGhostStructure(null);
       return;
     }
+    // If a warship/boat is selected, right-click cancels the selection rather
+    // than opening the context menu (#4692).
+    if (this.unitSelectionActive) {
+      this.eventBus.emit(new UnitSelectionEvent(null, false));
+      return;
+    }
     this.eventBus.emit(new ContextMenuEvent(event.clientX, event.clientY));
   }
 
   private setGhostStructure(ghostStructure: PlayerBuildableUnitType | null) {
-    this.uiState.ghostStructure = ghostStructure;
+    if (
+      this.uiState.ghostStructure === ghostStructure &&
+      ghostStructure !== null
+    ) {
+      this.uiState.upgradeMultiplier =
+        this.uiState.upgradeMultiplier === 1 ? 5 : 1;
+    } else {
+      this.uiState.upgradeMultiplier = 1;
+      this.uiState.ghostStructure = ghostStructure;
+    }
   }
 
   /**
@@ -1081,6 +1193,7 @@ export class InputHandler {
       clearInterval(this.moveInterval);
     }
     this.activeKeys.clear();
+    this.lastGestureScale = null;
     this.keybindAndEvent = [];
   }
 }

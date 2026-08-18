@@ -12,9 +12,10 @@ import {
   TRAIL_EFFECT_TYPES,
   type TrailEffectAttributes,
 } from "../core/CosmeticSchemas";
-import { decodePatternData } from "../core/PatternDecoder";
 import { PlayerType } from "../core/game/Game";
+import { decodePatternData } from "../core/PatternDecoder";
 import { getCachedCosmetics } from "./Cosmetics";
+import { buildTerrainRowSpans } from "./render/frame/derive/TerrainRowSpans";
 import { uploadFrameData } from "./render/frame/Upload";
 // Type-only: a value import would pull GPURenderer and its `.glsl?raw` shader
 // imports into any non-Vite consumer (e.g. the Node perf harness).
@@ -30,6 +31,7 @@ import {
   EFFECT_PALETTE_BLOCKS,
   MAX_TRAIL_COLORS,
   STRUCTURES_EFFECT_BLOCK,
+  WARSHIP_EFFECT_BLOCK,
 } from "./render/gl/utils/ColorUtils";
 import {
   UT_ATOM_BOMB,
@@ -51,15 +53,18 @@ const SMALL_PLAYER_GLOW_RESCAN_TICKS = 10;
 // The effect-palette block order: index = block (rows block·MAX_TRAIL_COLORS …).
 // trail.frag.glsl picks its block from the trail tile's nuke bit — block 0 =
 // transportShipTrail (nuke bit 0), block 1 = nukeTrail (nuke bit 1, set by
-// NUKE_TRAIL_BIT in TrailManager) — and structure.frag.glsl reads block
-// STRUCTURES_EFFECT_BLOCK (2). Reordering TRAIL_EFFECT_TYPES in CosmeticSchemas
-// (or moving the structures block) would silently swap effect colors, so these
-// guards fail the build if the shader-coupled order ever drifts.
+// NUKE_TRAIL_BIT in TrailManager) — structure.frag.glsl reads block
+// STRUCTURES_EFFECT_BLOCK (2), and unit.frag.glsl reads block
+// WARSHIP_EFFECT_BLOCK (3). Reordering TRAIL_EFFECT_TYPES in CosmeticSchemas
+// (or moving the structures/warship blocks) would silently swap effect colors,
+// so these guards fail the build if the shader-coupled order ever drifts.
 const _EFFECT_BLOCK_ORDER: readonly ["transportShipTrail", "nukeTrail"] =
   TRAIL_EFFECT_TYPES;
 void _EFFECT_BLOCK_ORDER;
 const _STRUCTURES_BLOCK_IS_2: 2 = STRUCTURES_EFFECT_BLOCK;
 void _STRUCTURES_BLOCK_IS_2;
+const _WARSHIP_BLOCK_IS_3: 3 = WARSHIP_EFFECT_BLOCK;
+void _WARSHIP_BLOCK_IS_3;
 
 // Attribute → render-param mappings:
 //   size      = the ring's final WIDTH (diameter) in world tiles when it fades
@@ -85,7 +90,7 @@ function toRgb01(s: string): [number, number, number] | null {
 }
 
 /** Resolve a nuke-explosion cosmetic's catalog attributes into render params. */
-function attributesToExplosionParams(
+export function attributesToExplosionParams(
   attrs: NukeExplosionAttributes,
 ): NukeExplosionRenderParams {
   // The shader cycles through the whole palette; the instance layout carries
@@ -103,7 +108,9 @@ function attributesToExplosionParams(
   };
   return attrs.type === "sparkles"
     ? { ...base, type: "sparkles", density: attrs.density }
-    : { ...base, type: "shockwave" };
+    : attrs.type === "embers"
+      ? { ...base, type: "embers", density: attrs.density }
+      : { ...base, type: "shockwave" };
 }
 
 /**
@@ -122,8 +129,9 @@ export class WebGLFrameBuilder {
   // Per-player effect palette, keyed by smallID. Layout is
   // 4096×(MAX_TRAIL_COLORS·EFFECT_PALETTE_BLOCKS): block 0 (rows 0–7) =
   // transportShipTrail, block 1 (rows 8–15) = nukeTrail, block 2 (rows 16–23)
-  // = structures. Consumed by TrailPass (block from the trail tile's nuke bit)
-  // and StructurePass (block 2).
+  // = structures, block 3 (rows 24–31) = warship. Consumed by TrailPass (block
+  // from the trail tile's nuke bit), StructurePass (block 2), and UnitPass
+  // (block 3).
   private readonly effectPalette: Float32Array;
   private readonly patternMeta: Float32Array;
   private readonly patternData: Uint8Array;
@@ -148,8 +156,6 @@ export class WebGLFrameBuilder {
   // unit colors, and SAM-radius perspective work. Push it once the local
   // player's update arrives (may take several ticks during join).
   private localPlayerSmallID = 0;
-  // Scratch buffer for terrain-delta uploads (parallel to the refs list).
-  private terrainDeltaBytes: Uint8Array = new Uint8Array(0);
 
   constructor(private readonly view: MapRenderer) {
     this.palette = new Float32Array(PALETTE_SIZE * 2 * 4);
@@ -206,6 +212,7 @@ export class WebGLFrameBuilder {
     this.syncSpawnOverlay(gameView);
     this.syncSmallPlayerGlow(gameView);
     this.syncTerrainDeltas(gameView);
+    this.syncNukeImpacts(gameView);
     this.resolveDeadUnitExplosions(gameView);
     uploadFrameData(this.view, gameView.frameData());
   }
@@ -271,18 +278,41 @@ export class WebGLFrameBuilder {
    * Water-nuke conversions (land → water) mutate the underlying terrain.
    * Forward this tick's terrain-changed refs to the renderer so it can
    * re-upload those texels in both the RGBA color texture and the R8UI
-   * water-detection texture used by railroads/bridges.
+   * water-detection texture used by railroads/bridges. Refs are batched into
+   * per-row spans — a massive bomb changes tens of thousands of tiles, and
+   * per-tile 1×1 uploads cost hundreds of ms of GL driver time.
    */
   private syncTerrainDeltas(gameView: GameView): void {
     const refs = gameView.recentlyUpdatedTerrainTiles();
     if (refs.length === 0) return;
-    if (this.terrainDeltaBytes.length < refs.length) {
-      this.terrainDeltaBytes = new Uint8Array(refs.length);
+    const { rects, bytes } = buildTerrainRowSpans(
+      refs,
+      gameView.width(),
+      (ref) => gameView.terrainByte(ref),
+    );
+    this.view.applyTerrainRects(rects, bytes);
+  }
+
+  /**
+   * Mark nukeable layer tiles as destroyed from this tick's nuke impacts.
+   * Uses the full blast radius (both land and water tiles), not just the
+   * terrain-changed subset.  Batches tile updates per layer for a single
+   * GPU texture upload per nukeable layer.
+   */
+  private syncNukeImpacts(gameView: GameView): void {
+    const nukedTiles = gameView.recentlyNukedTiles();
+    if (nukedTiles.length === 0) return;
+    const layers = gameView.layers();
+    for (const layer of layers) {
+      if (!layer.nukeable) continue;
+      // Filter blast-radius tiles to only those matching this layer's
+      // placement.  A water layer only needs water tiles destroyed; land
+      // tiles in the blast radius are invisible to it (shader discards).
+      const wantLand = layer.placement === "land";
+      const tiles = nukedTiles.filter((t) => gameView.isLand(t) === wantLand);
+      if (tiles.length === 0) continue;
+      this.view.markLayerTilesDestroyed(layer.id, tiles);
     }
-    for (let i = 0; i < refs.length; i++) {
-      this.terrainDeltaBytes[i] = gameView.terrainByte(refs[i]);
-    }
-    this.view.applyTerrainDelta(refs, this.terrainDeltaBytes);
   }
 
   private syncLocalPlayer(gameView: GameView): void {
@@ -442,6 +472,7 @@ export class WebGLFrameBuilder {
         displayName: p.displayName(),
         flag: flagUrl,
         crown: crownUrl,
+        verified: p.cosmetics.verified === true,
         color: p.territoryColor().toHex(),
       });
     }
@@ -476,17 +507,48 @@ export class WebGLFrameBuilder {
       // Resolve each trail-styled effectType into its own block of the effect
       // palette. rowBase block*MAX_TRAIL_COLORS must match the consumer
       // shaders' block layout (ship=0, nuke=1 in trail.frag.glsl; structures=2
-      // in structure.frag.glsl) — see _EFFECT_BLOCK_ORDER above. nukeExplosion
-      // is not trail-styled and renders through the FX pass instead.
-      const blockOrder = [...TRAIL_EFFECT_TYPES, "structures"] as const;
+      // in structure.frag.glsl; warship=3 in unit.frag.glsl) — see
+      // _EFFECT_BLOCK_ORDER above. nukeExplosion is not trail-styled and
+      // renders through the FX pass instead.
+      const blockOrder = [
+        ...TRAIL_EFFECT_TYPES,
+        "structures",
+        "warship",
+      ] as const;
       blockOrder.forEach((effectType, block) => {
         const selected = p.cosmetics.effects?.[effectType];
         if (!selected) return;
         const effect = findEffect(catalog, effectType, selected.name);
         if (!effect || effect.effectType !== effectType) return;
-        // Narrows attributes to trail attrs (structures share the shape).
-        if (!isTrailEffect(effect) && effect.effectType !== "structures") {
+        // Narrows attributes to trail attrs (structures/warship share the shape).
+        if (
+          !isTrailEffect(effect) &&
+          effect.effectType !== "structures" &&
+          effect.effectType !== "warship"
+        ) {
           return;
+        }
+        // Spiral vortexes render as ribbon geometry (SpiralRibbonPass) —
+        // hand the geometry + palette to the view's SpiralTrails. Colors are
+        // parsed here so a fully unparseable list degrades to the plain
+        // stamped trail instead of an uncolored vortex.
+        if (effectType === "nukeTrail" && effect.attributes.type === "spiral") {
+          const colors = effect.attributes.colors
+            .map((s) => colord(s))
+            .filter((c) => c.isValid())
+            .slice(0, MAX_TRAIL_COLORS)
+            .map((c) => {
+              const { r, g, b } = c.toRgb();
+              return [r / 255, g / 255, b / 255] as [number, number, number];
+            });
+          if (colors.length > 0) {
+            gameView.setNukeTrailSpiral(smallID, {
+              radius: effect.attributes.radius,
+              strands: effect.attributes.strands,
+              rotationSpeed: effect.attributes.rotationSpeed,
+              colors,
+            });
+          }
         }
         const rowBase = block * MAX_TRAIL_COLORS;
         if (this.writeEffectEntry(smallID, effect.attributes, rowBase)) {
@@ -503,9 +565,10 @@ export class WebGLFrameBuilder {
    * _EFFECT_BLOCK_ORDER). Within the block, row r holds color r's rgb, and the spare alpha
    * channels (rows rowBase+0..3 always exist) carry the scalar params —
    *   row 0.a = color count (0 → the shader falls back to the territory color),
-   *   row 1.a = styleId (0 = gradient, 1 = transition),
-   *   row 2.a = scalar0 (gradient: colorSize; transition: frequency),
-   *   row 3.a = scalar1 (gradient: movementSpeed; transition: unused).
+   *   row 1.a = styleId (0 = gradient, 1 = transition, 2 = spiral),
+   *   row 2.a = scalar0 (gradient: colorSize; transition: frequency;
+   *     spiral: rotationSpeed),
+   *   row 3.a = scalar1 (gradient: movementSpeed; others: unused).
    * colord doesn't throw on a bad color string (it returns black), so unparseable
    * colors are dropped — leaving an empty list, which falls back to the territory
    * color rather than rendering black. Returns whether any color was written.
@@ -528,10 +591,22 @@ export class WebGLFrameBuilder {
       this.effectPalette[off + 2] = c.b / 255;
       this.effectPalette[off + 3] = 0;
     }
-    const [styleId, scalar0, scalar1] =
-      attrs.type === "transition"
-        ? [1, attrs.frequency, 0]
-        : [0, attrs.colorSize, attrs.movementSpeed];
+    let styleId: number;
+    let scalar0: number;
+    let scalar1: number;
+    if (attrs.type === "transition") {
+      styleId = 1;
+      scalar0 = attrs.frequency;
+      scalar1 = 0;
+    } else if (attrs.type === "spiral") {
+      styleId = 2;
+      scalar0 = attrs.rotationSpeed;
+      scalar1 = 0;
+    } else {
+      styleId = 0;
+      scalar0 = attrs.colorSize;
+      scalar1 = attrs.movementSpeed;
+    }
     const alpha = (row: number) =>
       ((rowBase + row) * PALETTE_SIZE + smallID) * 4 + 3;
     this.effectPalette[alpha(0)] = colors.length;

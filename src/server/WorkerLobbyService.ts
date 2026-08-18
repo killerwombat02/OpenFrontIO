@@ -131,9 +131,13 @@ export class WorkerLobbyService {
   }
 
   private sendMyLobbiesToMaster() {
+    // Matchmaking games have a Public gameType (so they appear in
+    // publicLobbies()) but no publicGameType: they are invite-only and must
+    // never be advertised, and the master rejects entries without one.
     const publicLobbies = this.gm
       .publicLobbies()
       .map((g) => g.gameInfo())
+      .filter((gi) => gi.publicGameType !== undefined)
       .map((gi) => {
         return {
           gameID: gi.gameID,
@@ -156,6 +160,11 @@ export class WorkerLobbyService {
         gameConfig: gi.gameConfig && publicLobbyGameConfig(gi.gameConfig),
         publicGameType: "hosted",
         creatorID: g.hashedCreatorID(),
+        // Already sanitised on the way in (GameServer.setFeatured), so nothing
+        // unsanitised can reach a browser even if another producer appears.
+        label: g.lobbyLabel(),
+        accent: g.lobbyAccent(),
+        featured: g.isFeatured() ? true : undefined,
       } satisfies InternalGameInfo;
     });
     this.sendToMaster({

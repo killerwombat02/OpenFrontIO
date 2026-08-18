@@ -3,6 +3,7 @@ import {
   Cell,
   GameUpdates,
   PlayerID,
+  PlayerType,
   TerrainType,
   TerraNullius,
   Tick,
@@ -33,6 +34,8 @@ import { extractNukeTelegraphs } from "../render/frame/derive/NukeTelegraphs";
 import { computePlayerStatus } from "../render/frame/derive/PlayerStatus";
 import { buildRelationMatrix } from "../render/frame/derive/RelationMatrix";
 import { RailroadCache } from "../render/frame/RailroadCache";
+import type { SpiralParams } from "../render/frame/SpiralTrails";
+import { SpiralTrails } from "../render/frame/SpiralTrails";
 import { TrailManager } from "../render/frame/TrailManager";
 import type { FrameData, NameEntry } from "../render/types";
 import { STRUCTURE_TYPES } from "../render/types";
@@ -81,6 +84,7 @@ export class GameView implements GameMap {
   private _teams = new Map<number, string>();
   private updatedTiles: TileRef[] = [];
   private updatedTerrainTiles: TileRef[] = [];
+  private nukeImpactTiles: TileRef[] = [];
   /**
    * Active units grouped by owner smallID, built lazily at most once per
    * tick. Keeps per-player unit queries (PlayerView.units) at O(own units)
@@ -92,6 +96,7 @@ export class GameView implements GameMap {
 
   // ── FrameData accumulators (renderer-bound state) ─────────────────────
   private trailManager!: TrailManager;
+  private spiralTrails!: SpiralTrails;
   private railroadCache!: RailroadCache;
   /** Long-lived NameEntry map for the renderer's NamePass. */
   private _names = new Map<string, NameEntry>();
@@ -154,6 +159,7 @@ export class GameView implements GameMap {
     this._cosmetics = new Map(
       humans.map((h) => [h.clientID, h.cosmetics ?? {}]),
     );
+
     for (const nation of this._mapData.nations) {
       // Nations don't have client ids, so we use their name as the key instead.
       this._cosmetics.set(nation.name, {
@@ -171,6 +177,7 @@ export class GameView implements GameMap {
     const mapW = this._map.width();
     const mapH = this._map.height();
     this.trailManager = new TrailManager(mapW, mapH);
+    this.spiralTrails = new SpiralTrails(mapW);
     this.railroadCache = new RailroadCache(mapW, mapH);
 
     // Long-lived FrameData. Most fields are mutable references to long-lived
@@ -183,6 +190,7 @@ export class GameView implements GameMap {
       inSpawnPhase: true,
       tileState: this._map.tileStateBuffer(),
       trailState: this.trailManager.getTrailState(),
+      spiralRibbons: this.spiralTrails.getRibbons(),
       railroadState: this.railroadCache.railroadState,
       units: this._unitStates,
       players: this._playerStates,
@@ -292,6 +300,10 @@ export class GameView implements GameMap {
       }
     }
 
+    // Nuke blast-radius tiles (for nukeable layer destruction).
+    const packedNukes = gu.packedNukeImpacts;
+    this.nukeImpactTiles = packedNukes ? Array.from(packedNukes) : [];
+
     if (gu.packedMotionPlans) {
       const records = unpackMotionPlans(gu.packedMotionPlans);
       this.applyMotionPlanRecords(records);
@@ -343,6 +355,7 @@ export class GameView implements GameMap {
       if (pu.clientID !== undefined && pu.clientID === this._myClientID) {
         pu.name = this._myUsername;
         pu.displayName = myDisplayName;
+        pu.clanTag = this._myClanTag;
       }
 
       if (pu.smallID !== undefined) {
@@ -371,8 +384,12 @@ export class GameView implements GameMap {
           pu,
           gu.playerNameViewData?.[pu.id],
           // First check human by clientID, then check nation by name.
+          // Only match by name for actual Nations — not Bots (tribes) whose
+          // random names may coincidentally match a nation name.
           this._cosmetics.get(pu.clientID ?? "") ??
-            this._cosmetics.get(pu.name!) ??
+            (pu.playerType === PlayerType.Nation
+              ? this._cosmetics.get(pu.name!)
+              : undefined) ??
             {},
         );
         this._players.set(pu.id, player);
@@ -471,7 +488,15 @@ export class GameView implements GameMap {
         ) {
           this._structuresDirty = true;
         }
+        const hasMotionPlan = this.unitMotionPlans.has(update.id);
+        const oldPos = unit.state.pos;
+        const oldLastPos = unit.state.lastPos;
         unit.update(update);
+        if (hasMotionPlan) {
+          unit.state.pos = oldPos;
+          unit.state.lastPos = oldLastPos;
+          unit.lastPos.pop();
+        }
       } else {
         unit = new UnitView(this, update);
         this._units.set(update.id, unit);
@@ -524,6 +549,12 @@ export class GameView implements GameMap {
       }
     }
     this.trailManager.update(
+      this._unitStates as Map<number, import("../render/types").UnitState>,
+      this._trailIdsScratch,
+    );
+    // Spiral nukeTrail ribbons follow the same tracked units; extends the
+    // path of each live spiral-cosmetic nuke and drops dead ones.
+    this.spiralTrails.update(
       this._unitStates as Map<number, import("../render/types").UnitState>,
       this._trailIdsScratch,
     );
@@ -599,6 +630,8 @@ export class GameView implements GameMap {
       // carried over on the frame from the last rebuild.
       f.relationMatrix,
       f.relationSize,
+      this.unitMotionPlans,
+      gu.tick,
     );
     f.attackRings = this._myPlayer
       ? extractAttackRings(
@@ -672,6 +705,16 @@ export class GameView implements GameMap {
   /** Public accessor: the renderer reads this and uploads to the GPU. */
   frameData(): FrameData {
     return this._frame;
+  }
+
+  /**
+   * Set a player's spiral nuke-trail geometry (from their nukeTrail
+   * cosmetic). Pushed by WebGLFrameBuilder once the player's effect
+   * resolves; their nukes then grow helix ribbons (SpiralTrails →
+   * SpiralRibbonPass) on top of the plain stamped trail.
+   */
+  setNukeTrailSpiral(smallID: number, params: SpiralParams): void {
+    this.spiralTrails.setParams(smallID, params);
   }
 
   private advanceMotionPlannedUnits(currentTick: Tick): void {
@@ -912,6 +955,9 @@ export class GameView implements GameMap {
   recentlyUpdatedTerrainTiles(): TileRef[] {
     return this.updatedTerrainTiles;
   }
+  recentlyNukedTiles(): TileRef[] {
+    return this.nukeImpactTiles;
+  }
 
   nearbyUnits(
     tile: TileRef,
@@ -1062,6 +1108,9 @@ export class GameView implements GameMap {
   config(): Config {
     return this._config;
   }
+  isSpectator(): boolean {
+    return !this.myPlayer()?.isAlive() || this._config.isReplay();
+  }
   units(...types: UnitType[]): UnitView[] {
     if (types.length === 0) {
       return Array.from(this._units.values()).filter((u) => u.isActive());
@@ -1141,6 +1190,10 @@ export class GameView implements GameMap {
   }
   numLandTiles(): number {
     return this._map.numLandTiles();
+  }
+  /** Map layers defined in the map's info.json, if any. */
+  layers(): import("../../core/game/TerrainMapLoader").MapLayer[] {
+    return this._mapData.layers ?? [];
   }
   isValidCoord(x: number, y: number): boolean {
     return this._map.isValidCoord(x, y);
